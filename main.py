@@ -1,1318 +1,1340 @@
 import asyncio
-import json
-import random
 import logging
+import sqlite3
+import random
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
-from enum import Enum
+from typing import List, Dict, Tuple
 
-from telegram import (
-    Update, 
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    User
-)
-from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    MessageHandler, 
-    CallbackQueryHandler,
-    ContextTypes, 
-    ConversationHandler,
-    filters
-)
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = "7939238322:AAEAN-l0srLH7YmNRCbWBDRWzwd-fwN025w"
+CHANNEL_USERNAME = "@k1lossez"
+GROUP_ID = -5197819981
+ADMIN_IDS = [7546928092]
+MAX_TEAMS = 16
+TEAM_SIZE = 5
+
+# ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Ваши данные
-OWNER_ID = 7546928092
-ADMIN_GROUP_ID = -5197819981
-NOTIFICATION_CHANNEL_ID = -1003663395719
-TOKEN = "7939238322:AAEAN-l0srLH7YmNRCbWBDRWzwd-fwN025w"
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
-# Состояния для ConversationHandler
-class States(Enum):
-    TEAM_NAME = 1
-    TEAM_PHOTO = 2
-    PLAYERS = 3
-    PLAYER_USERNAMES = 4
-    DEVICE_TYPE = 5
-    CONFIRM_REGISTRATION = 6
-    ADMIN_SETTINGS = 7
-    ADMIN_TEAM_LIMIT = 8
-    ADMIN_PLAYER_LIMIT = 9
-    ADMIN_ADD_ADMIN = 10
-    ADMIN_ADD_PLAYER = 11
+# ========== БАЗА ДАННЫХ ==========
+conn = sqlite3.connect('tournament.db', check_same_thread=False, isolation_level=None)
+cursor = conn.cursor()
 
-# Хранилище данных
-@dataclass
-class Player:
-    telegram_id: Optional[int]
-    username: str
-    full_name: str = ""
-    device_type: str = ""  # PC или MOBILE
-    cc_ms: str = ""  # CC/MS система для мобильных игроков
-    contact_confirmed: bool = False
-    
-    def to_dict(self):
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data):
-        return cls(**data)
+# Удаляем старые таблицы и создаем новые с правильной структурой
+cursor.execute('DROP TABLE IF EXISTS applications')
+cursor.execute('''
+CREATE TABLE applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    full_name TEXT,
+    team_name TEXT,
+    team_members TEXT,
+    contact TEXT,
+    status TEXT DEFAULT 'pending',
+    tournament_group INTEGER DEFAULT NULL,
+    tournament_position INTEGER DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+''')
 
-@dataclass
-class Team:
-    name: str
-    photo: str
-    captain_id: int
-    captain_username: str
-    players: List[Player]
-    device_type: str
-    status: str = "pending"  # pending, approved, rejected
-    created_at: datetime = None
-    
-    def __post_init__(self):
-        if self.created_at is None:
-            self.created_at = datetime.now()
-    
-    def to_dict(self):
-        data = asdict(self)
-        data['players'] = [player.to_dict() for player in self.players]
-        data['created_at'] = self.created_at.isoformat()
-        return data
-    
-    @classmethod
-    def from_dict(cls, data):
-        data['players'] = [Player.from_dict(p) for p in data['players']]
-        data['created_at'] = datetime.fromisoformat(data['created_at'])
-        return cls(**data)
+cursor.execute('DROP TABLE IF EXISTS tournament_settings')
+cursor.execute('''
+CREATE TABLE tournament_settings (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    max_teams INTEGER DEFAULT 16,
+    team_size INTEGER DEFAULT 5,
+    channel_username TEXT DEFAULT '@ваш_канал',
+    tournament_started BOOLEAN DEFAULT 0,
+    tournament_stage TEXT DEFAULT 'registration'
+)
+''')
 
-class Storage:
-    def __init__(self):
-        self.teams: Dict[str, Team] = {}
-        self.admins: List[int] = [OWNER_ID]  # Владелец автоматически админ
-        self.config = {
-            "max_teams": 16,
-            "players_per_team": 5,
-            "registration_open": True,
-            "brackets_generated": False,
-            "notification_channel": NOTIFICATION_CHANNEL_ID
-        }
-        self.registrations: Dict[int, dict] = {}
-        self.matches = []
+cursor.execute('DROP TABLE IF EXISTS admins')
+cursor.execute('''
+CREATE TABLE admins (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+''')
+
+# Настройки по умолчанию
+cursor.execute("INSERT OR IGNORE INTO tournament_settings (id, max_teams, team_size, channel_username) VALUES (1, ?, ?, ?)", 
+               (MAX_TEAMS, TEAM_SIZE, CHANNEL_USERNAME))
+
+# Добавляем администраторов по умолчанию
+for admin_id in ADMIN_IDS:
+    cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (admin_id,))
+
+conn.commit()
+
+# ========== УТИЛИТЫ ==========
+def get_settings():
+    """Получение текущих настроек турнира"""
+    return cursor.execute("SELECT max_teams, team_size, channel_username, tournament_started, tournament_stage FROM tournament_settings WHERE id=1").fetchone()
+
+def get_stats():
+    """Получение статистики заявок"""
+    stats = cursor.execute('''
+        SELECT status, COUNT(*) FROM applications 
+        GROUP BY status
+    ''').fetchall()
+    return dict(stats)
+
+def is_admin(user_id: int) -> bool:
+    """Проверка, является ли пользователь администратором"""
+    admin = cursor.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)).fetchone()
+    return admin is not None
+
+def is_main_admin(user_id: int) -> bool:
+    """Проверка, является ли пользователь главным администратором"""
+    return user_id == ADMIN_IDS[0]
+
+async def check_subscription(user_id: int) -> bool:
+    """Проверка подписки пользователя на канал"""
+    try:
+        settings = get_settings()
+        channel_username = settings[2]
         
-    def save_to_file(self, filename='tournament_data.json'):
-        """Сохранить данные в файл"""
-        data = {
-            'teams': {name: team.to_dict() for name, team in self.teams.items()},
-            'admins': self.admins,
-            'config': self.config,
-            'matches': self.matches
-        }
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        if not channel_username or channel_username == '@ваш_канал':
+            return True
+        
+        chat = await bot.get_chat(channel_username)
+        member = await bot.get_chat_member(chat_id=chat.id, user_id=user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception as e:
+        logger.error(f"Ошибка проверки подписки: {e}")
+        return True
+
+def get_all_admins():
+    """Получение списка всех администраторов"""
+    return cursor.execute("SELECT user_id, username FROM admins ORDER BY added_at").fetchall()
+
+def get_all_users():
+    """Получение всех пользователей с заявками"""
+    return cursor.execute("SELECT DISTINCT user_id FROM applications").fetchall()
+
+def get_approved_teams():
+    """Получение всех одобренных команд"""
+    return cursor.execute(
+        "SELECT id, team_name, full_name, contact, user_id FROM applications WHERE status='approved' ORDER BY id"
+    ).fetchall()
+
+def start_tournament():
+    """Запуск турнира"""
+    cursor.execute("UPDATE tournament_settings SET tournament_started=1, tournament_stage='group_stage' WHERE id=1")
+    conn.commit()
+
+def reset_tournament():
+    """Сброс турнира"""
+    cursor.execute("UPDATE applications SET tournament_group=NULL, tournament_position=NULL")
+    cursor.execute("UPDATE tournament_settings SET tournament_started=0, tournament_stage='registration' WHERE id=1")
+    conn.commit()
+
+def create_tournament_bracket():
+    """Создание турнирной сетки"""
+    teams = get_approved_teams()
     
-    def load_from_file(self, filename='tournament_data.json'):
-        """Загрузить данные из файла"""
-        try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+    if len(teams) < 2:
+        return None
+    
+    # Рандомизируем порядок команд
+    random.shuffle(teams)
+    
+    # Определяем количество групп (по 4 команды в группе)
+    num_groups = (len(teams) + 3) // 4
+    
+    # Распределяем команды по группам
+    groups = {}
+    for i, team in enumerate(teams):
+        group_num = (i % num_groups) + 1
+        position = (i // num_groups) + 1
+        
+        cursor.execute(
+            "UPDATE applications SET tournament_group=?, tournament_position=? WHERE id=?",
+            (group_num, position, team[0])
+        )
+        
+        if group_num not in groups:
+            groups[group_num] = []
+        groups[group_num].append(team)
+    
+    conn.commit()
+    return groups
+
+def get_tournament_bracket():
+    """Получение турнирной сетки"""
+    teams = cursor.execute(
+        "SELECT tournament_group, tournament_position, team_name, full_name FROM applications WHERE status='approved' AND tournament_group IS NOT NULL ORDER BY tournament_group, tournament_position"
+    ).fetchall()
+    
+    groups = {}
+    for team in teams:
+        group_num = team[0]
+        if group_num not in groups:
+            groups[group_num] = []
+        groups[group_num].append(team)
+    
+    return groups
+
+# ========== СОСТОЯНИЯ (FSM) ==========
+class RegistrationStates(StatesGroup):
+    waiting_full_name = State()
+    waiting_team_name = State()
+    waiting_team_members = State()
+    waiting_contact = State()
+
+class AdminStates(StatesGroup):
+    waiting_max_teams = State()
+    waiting_team_size = State()
+    waiting_channel_username = State()
+    waiting_admin_id = State()
+    waiting_broadcast_message = State()
+    waiting_broadcast_filter = State()
+
+# ========== КОМАНДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ==========
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    """Обработка команды /start"""
+    user_id = message.from_user.id
+    
+    settings = get_settings()
+    channel_username = settings[2]
+    
+    # Проверка подписки
+    if channel_username and channel_username != '@ваш_канал':
+        if not await check_subscription(user_id):
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{channel_username[1:]}")],
+                [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_subscription")]
+            ])
             
-            self.teams = {
-                name: Team.from_dict(team_data) 
-                for name, team_data in data.get('teams', {}).items()
-            }
-            self.admins = data.get('admins', self.admins)
-            self.config = data.get('config', self.config)
-            self.matches = data.get('matches', [])
-            logger.info("Данные загружены из файла")
-        except FileNotFoundError:
-            logger.info("Файл данных не найден, создан новый")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки данных: {e}")
-
-storage = Storage()
-
-class TournamentBot:
-    def __init__(self, token: str):
-        self.token = token
-        self.load_data()
-    
-    def load_data(self):
-        """Загрузка данных при инициализации"""
-        storage.load_from_file()
-    
-    def save_data(self):
-        """Сохранение данных"""
-        storage.save_to_file()
-    
-    async def is_admin(self, user_id: int) -> bool:
-        """Проверка, является ли пользователь админом"""
-        return user_id in storage.admins
-    
-    async def add_admin(self, user_id: int):
-        """Добавить администратора"""
-        if user_id not in storage.admins:
-            storage.admins.append(user_id)
-            self.save_data()
-            return True
-        return False
-    
-    async def remove_admin(self, user_id: int):
-        """Удалить администратора"""
-        if user_id in storage.admins and user_id != OWNER_ID:
-            storage.admins.remove(user_id)
-            self.save_data()
-            return True
-        return False
-    
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
-        user = update.effective_user
-        user_id = user.id
-        
-        if not storage.config["registration_open"]:
-            await update.message.reply_text(
-                "❌ Регистрация на турнир закрыта!",
-                reply_markup=ReplyKeyboardRemove()
+            await message.answer(
+                f"📢 Для регистрации на турнир необходимо подписаться на наш канал: {channel_username}\n\n"
+                "После подписки нажмите кнопку 'Я подписался'.",
+                reply_markup=keyboard
             )
             return
+    
+    # Пользователь подписан или проверка отключена
+    stats = get_stats()
+    approved = stats.get('approved', 0)
+    settings = get_settings()
+    
+    # Проверяем, начался ли турнир
+    if settings[3]:  # tournament_started
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📊 Статус заявки")],
+                [KeyboardButton(text="🏆 Турнирная сетка")],
+                [KeyboardButton(text="📋 Моя группа")]
+            ],
+            resize_keyboard=True
+        )
         
-        # Проверяем, не зарегистрирована ли уже команда
-        user_teams = [team for team in storage.teams.values() 
-                     if any(player.telegram_id == user_id for player in team.players)]
+        # Получаем информацию о группе пользователя
+        user_team = cursor.execute(
+            "SELECT tournament_group, tournament_position, team_name FROM applications WHERE user_id=? AND status='approved'",
+            (user_id,)
+        ).fetchone()
         
-        if user_teams:
-            await update.message.reply_text(
-                "⚠️ Вы уже зарегистрированы в команде!\n"
-                f"Ваша команда: {user_teams[0].name}",
-                reply_markup=ReplyKeyboardRemove()
-            )
+        if user_team:
+            group_info = f"\n\nВаша команда '{user_team[2]}' находится в Группе {user_team[0]}, позиция {user_team[1]}"
+        else:
+            group_info = ""
+        
+        await message.answer(
+            f"🏆 Турнир начался!\n\n"
+            f"📊 Статистика:\n"
+            f"• Зарегистрировано команд: {approved}/{settings[0]}\n"
+            f"• Стадия турнира: {settings[4]}\n"
+            f"{group_info}",
+            reply_markup=keyboard
+        )
+    else:
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📝 Подать заявку")],
+                [KeyboardButton(text="📊 Статус заявки")]
+            ],
+            resize_keyboard=True
+        )
+        
+        await message.answer(
+            f"🏆 Добро пожаловать в регистрацию на турнир!\n\n"
+            f"📊 Статистика:\n"
+            f"• Зарегистрировано команд: {approved}/{settings[0]}\n"
+            f"• Игроков в команде: {settings[1]}\n\n"
+            f"Для подачи заявки нажмите кнопку ниже.",
+            reply_markup=keyboard
+        )
+
+@dp.callback_query(F.data == "check_subscription")
+async def check_subscription_callback(callback: types.CallbackQuery):
+    """Обработка нажатия кнопки проверки подписки"""
+    user_id = callback.from_user.id
+    
+    if await check_subscription(user_id):
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📝 Подать заявку")]],
+            resize_keyboard=True
+        )
+        
+        await callback.message.delete()
+        await bot.send_message(
+            chat_id=user_id,
+            text="✅ Отлично! Теперь вы можете подать заявку.",
+            reply_markup=keyboard
+        )
+    else:
+        await callback.answer(
+            "Вы ещё не подписались на канал!",
+            show_alert=True
+        )
+
+@dp.message(F.text == "📝 Подать заявку")
+async def start_registration(message: types.Message, state: FSMContext):
+    """Начало процесса регистрации"""
+    user_id = message.from_user.id
+    settings = get_settings()
+    
+    # Проверяем, не начался ли уже турнир
+    if settings[3]:  # tournament_started
+        await message.answer("❌ Регистрация закрыта! Турнир уже начался.")
+        return
+    
+    # Проверка подписки
+    if settings[2] and settings[2] != '@ваш_канал':
+        if not await check_subscription(user_id):
+            await message.answer(f"❌ Сначала подпишитесь на канал: {settings[2]}")
             return
-        
-        # Проверяем, не является ли пользователь капитаном другой команды
-        for team in storage.teams.values():
-            if team.captain_id == user_id:
-                await update.message.reply_text(
-                    "⚠️ Вы уже являетесь капитаном команды!\n"
-                    f"Ваша команда: {team.name}",
-                    reply_markup=ReplyKeyboardRemove()
-                )
-                return
-        
-        keyboard = [
-            [InlineKeyboardButton("PC 🖥️", callback_data="device_pc")],
-            [InlineKeyboardButton("MOBILE 📱", callback_data="device_mobile")]
+    
+    # Проверка существующей заявки
+    existing = cursor.execute(
+        "SELECT status FROM applications WHERE user_id=?", 
+        (user_id,)
+    ).fetchone()
+    
+    if existing:
+        status = existing[0]
+        if status == 'pending':
+            await message.answer("⏳ Ваша заявка уже на рассмотрении!")
+            return
+        elif status == 'approved':
+            await message.answer("✅ Ваша заявка уже одобрена!")
+            return
+        elif status == 'rejected':
+            cursor.execute("DELETE FROM applications WHERE user_id=?", (user_id,))
+            conn.commit()
+    
+    # Проверка лимита команд
+    stats = get_stats()
+    approved = stats.get('approved', 0)
+    
+    if approved >= settings[0]:
+        await message.answer("❌ Регистрация закрыта! Достигнут лимит команд.")
+        return
+    
+    # Начинаем регистрацию
+    await message.answer(
+        "📋 Начнём регистрацию!\n\n"
+        "Скажите как к вам обращаться?:",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+    await state.set_state(RegistrationStates.waiting_full_name)
+
+@dp.message(RegistrationStates.waiting_full_name)
+async def process_full_name(message: types.Message, state: FSMContext):
+    """Обработка ФИО"""
+    await state.update_data(full_name=message.text)
+    await message.answer("🏷️ Введите название команды:")
+    await state.set_state(RegistrationStates.waiting_team_name)
+
+@dp.message(RegistrationStates.waiting_team_name)
+async def process_team_name(message: types.Message, state: FSMContext):
+    """Обработка названия команды"""
+    await state.update_data(team_name=message.text)
+    
+    settings = get_settings()
+    await message.answer(
+        f"👥 Введите состав команды ({settings[1]} игроков):\n"
+        f"Формат: ИГРОК 1, ИГРОК 2, ...\n"
+        f"Пример: ИГРОК 1, ИГРОК 2, ИГРОК 3"
+    )
+    await state.set_state(RegistrationStates.waiting_team_members)
+
+@dp.message(RegistrationStates.waiting_team_members)
+async def process_team_members(message: types.Message, state: FSMContext):
+    """Обработка состава команды"""
+    settings = get_settings()
+    required_size = settings[1]
+    
+    members = [m.strip() for m in message.text.split(',')]
+    
+    if len(members) != required_size:
+        await message.answer(f"❌ Неверное количество игроков! Нужно {required_size} человек.")
+        return
+    
+    await state.update_data(team_members=message.text)
+    await message.answer("📞 Введите ваш контакт для связи (Telegram @ник или телефон):")
+    await state.set_state(RegistrationStates.waiting_contact)
+
+@dp.message(RegistrationStates.waiting_contact)
+async def process_contact(message: types.Message, state: FSMContext):
+    """Обработка контакта и завершение регистрации"""
+    user_id = message.from_user.id
+    user_data = await state.get_data()
+    
+    # Сохраняем заявку в БД
+    cursor.execute(
+        '''INSERT INTO applications 
+        (user_id, username, full_name, team_name, team_members, contact) 
+        VALUES (?, ?, ?, ?, ?, ?)''',
+        (
+            user_id,
+            message.from_user.username,
+            user_data['full_name'],
+            user_data['team_name'],
+            user_data['team_members'],
+            message.text
+        )
+    )
+    conn.commit()
+    app_id = cursor.lastrowid
+    
+    # Отправляем заявку в группу для модерации
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{app_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{app_id}")
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            f"🎮 Добро пожаловать в регистрацию на турнир!\n\n"
-            f"Текущие настройки турнира:\n"
-            f"• Максимум команд: {storage.config['max_teams']}\n"
-            f"• Игроков в команде: {storage.config['players_per_team']}\n"
-            f"• Доступно мест: {storage.config['max_teams'] - len([t for t in storage.teams.values() if t.status == 'approved'])}\n\n"
-            f"Выберите тип устройства для вашей команды:",
-            reply_markup=reply_markup
-        )
-        
-        return States.DEVICE_TYPE.value
+    ])
     
-    async def choose_device(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Выбор типа устройства"""
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        device_type = "PC" if "pc" in query.data else "MOBILE"
-        
-        # Сохраняем выбор устройства
-        storage.registrations[user_id] = {
-            "device_type": device_type,
-            "captain_id": user_id,
-            "captain_username": query.from_user.username or query.from_user.first_name,
-            "captain_full_name": query.from_user.full_name
-        }
-        
-        await query.edit_message_text(
-            f"✅ Тип устройства выбран: {device_type}\n\n"
-            "Теперь введите название вашей команды:"
+    try:
+        await bot.send_message(
+            chat_id=GROUP_ID,
+            text=f"📨 НОВАЯ ЗАЯВКА #{app_id}\n\n"
+                 f"👤 Игрок: {user_data['full_name']}\n"
+                 f"📱 Контакт: {message.text}\n"
+                 f"👤 Telegram: @{message.from_user.username or 'нет'}\n"
+                 f"🏷️ Команда: {user_data['team_name']}\n"
+                 f"👥 Состав:\n{user_data['team_members']}\n\n"
+                 f"🆔 User ID: {user_id}",
+            reply_markup=keyboard
         )
-        
-        return States.TEAM_NAME.value
+    except Exception as e:
+        logger.error(f"Ошибка отправки в группу: {e}")
     
-    async def get_team_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Получение названия команды"""
-        user_id = update.message.from_user.id
-        team_name = update.message.text.strip()
-        
-        # Проверяем, не занято ли название
-        if team_name in storage.teams:
-            await update.message.reply_text(
-                "❌ Это название команды уже занято! Пожалуйста, выберите другое название:"
-            )
-            return States.TEAM_NAME.value
-        
-        if len(team_name) < 3:
-            await update.message.reply_text(
-                "❌ Название команды должно быть не менее 3 символов!"
-            )
-            return States.TEAM_NAME.value
-        
-        storage.registrations[user_id]["team_name"] = team_name
-        
-        await update.message.reply_text(
-            f"✅ Название команды сохранено: {team_name}\n\n"
-            "Теперь отправьте фото для вашей команды (логотип, групповое фото и т.д.):"
-        )
-        
-        return States.TEAM_PHOTO.value
+    # Сообщаем пользователю
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📊 Статус заявки")]],
+        resize_keyboard=True
+    )
     
-    async def get_team_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Получение фото команды"""
-        user_id = update.message.from_user.id
-        
-        if not update.message.photo:
-            await update.message.reply_text("Пожалуйста, отправьте фото!")
-            return States.TEAM_PHOTO.value
-        
-        # Берем последнее (самое большое) фото
-        photo = update.message.photo[-1]
-        photo_id = photo.file_id
-        
-        storage.registrations[user_id]["photo_id"] = photo_id
-        
-        await update.message.reply_text(
-            "✅ Фото команды сохранено!\n\n"
-            "Теперь введите количество игроков в команде (включая себя):"
-        )
-        
-        return States.PLAYERS.value
+    await message.answer(
+        "✅ Заявка отправлена на модерацию!\n"
+        "Ожидайте решения в течение 24 часов.",
+        reply_markup=keyboard
+    )
     
-    async def get_players_count(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Получение количества игроков"""
-        user_id = update.message.from_user.id
+    await state.clear()
+
+@dp.message(F.text == "📊 Статус заявки")
+async def check_status(message: types.Message):
+    """Проверка статуса заявки"""
+    user_id = message.from_user.id
+    
+    app = cursor.execute(
+        "SELECT status, team_name, tournament_group, tournament_position FROM applications WHERE user_id=?", 
+        (user_id,)
+    ).fetchone()
+    
+    if not app:
+        await message.answer("❌ У вас нет активных заявок.")
+        return
+    
+    status_text = {
+        'pending': '⏳ На рассмотрении',
+        'approved': '✅ Одобрена',
+        'rejected': '❌ Отклонена'
+    }
+    
+    response = f"📋 Ваша заявка:\nКоманда: {app[1]}\nСтатус: {status_text.get(app[0], app[0])}"
+    
+    if app[2] and app[3]:  # Если есть группа и позиция
+        response += f"\n\n🏆 Турнирное положение:\nГруппа: {app[2]}\nПозиция в группе: {app[3]}"
+    
+    await message.answer(response)
+
+@dp.message(F.text == "🏆 Турнирная сетка")
+async def show_bracket(message: types.Message):
+    """Показать турнирную сетку"""
+    settings = get_settings()
+    
+    if not settings[3]:  # Если турнир не начат
+        await message.answer("Турнир ещё не начался.")
+        return
+    
+    groups = get_tournament_bracket()
+    
+    if not groups:
+        await message.answer("Турнирная сетка ещё не сформирована.")
+        return
+    
+    text = "🏆 ТУРНИРНАЯ СЕТКА 🏆\n\n"
+    
+    for group_num in sorted(groups.keys()):
+        text += f"════════════════════\n"
+        text += f"📊 ГРУППА {group_num}:\n"
+        text += f"════════════════════\n"
         
-        try:
-            players_count = int(update.message.text)
-            max_players = storage.config["players_per_team"]
-            
-            if players_count < 2:
-                await update.message.reply_text(
-                    "❌ В команде должно быть как минимум 2 игрока!\n"
-                    "Введите количество игроков:"
-                )
-                return States.PLAYERS.value
-            
-            if players_count > max_players:
-                await update.message.reply_text(
-                    f"❌ Слишком много игроков! Максимум {max_players}\n"
-                    "Введите количество игроков:"
-                )
-                return States.PLAYERS.value
-            
-            storage.registrations[user_id]["players_count"] = players_count
-            storage.registrations[user_id]["players"] = []
-            
-            # Начинаем сбор информации об игроках
-            context.user_data["current_player"] = 1
-            context.user_data["total_players"] = players_count
-            
-            # Создаем капитана
-            captain = Player(
-                telegram_id=user_id,
-                username=f"@{update.message.from_user.username}" if update.message.from_user.username else update.message.from_user.first_name,
-                full_name=update.message.from_user.full_name,
-                device_type=storage.registrations[user_id]["device_type"],
-                contact_confirmed=True
-            )
-            
-            # Назначаем CC/MS для капитана если MOBILE
-            if captain.device_type == "MOBILE":
-                captain.cc_ms = "CC"  # Капитан всегда CC
-            
-            storage.registrations[user_id]["players"].append(captain)
-            
-            if players_count > 1:
-                context.user_data["current_player"] = 2
-                
-                await update.message.reply_text(
-                    f"✅ Капитан добавлен!\n\n"
-                    f"🎮 Игрок 2 из {players_count}\n"
-                    "Введите Telegram username игрока (например, @username):"
-                )
-                return States.PLAYER_USERNAMES.value
+        for team in groups[group_num]:
+            text += f"{team[1]}. {team[2]} ({team[3]})\n"
+        
+        text += "\n"
+    
+    await message.answer(text)
+
+@dp.message(F.text == "📋 Моя группа")
+async def show_my_group(message: types.Message):
+    """Показать группу пользователя"""
+    user_id = message.from_user.id
+    
+    team_info = cursor.execute(
+        "SELECT tournament_group, tournament_position, team_name FROM applications WHERE user_id=? AND status='approved'",
+        (user_id,)
+    ).fetchone()
+    
+    if not team_info or not team_info[0]:
+        await message.answer("❌ Вы не участвуете в турнире или группа ещё не определена.")
+        return
+    
+    group_num = team_info[0]
+    
+    # Получаем все команды в этой группе
+    teams_in_group = cursor.execute(
+        "SELECT tournament_position, team_name, full_name FROM applications WHERE tournament_group=? AND status='approved' ORDER BY tournament_position",
+        (group_num,)
+    ).fetchall()
+    
+    text = f"📋 ВАША ГРУППА {group_num}:\n\n"
+    
+    for pos, team_name, captain in teams_in_group:
+        if pos == team_info[1]:
+            text += f"👉 {pos}. {team_name} (ваша команда)\n"
+        else:
+            text += f"   {pos}. {team_name}\n"
+    
+    text += f"\nКапитан вашей команды: {team_info[2]}"
+    
+    await message.answer(text)
+
+# ========== АДМИН ПАНЕЛЬ ==========
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    """Панель администратора"""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    
+    settings = get_settings()
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="⚙️ Настройки турнира", callback_data="admin_settings")],
+        [InlineKeyboardButton(text="👨‍💼 Управление админами", callback_data="admin_manage")],
+        [InlineKeyboardButton(text="📋 Все заявки", callback_data="admin_applications")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🏆 Управление турниром", callback_data="admin_tournament")]
+    ])
+    
+    status = "✅ Запущен" if settings[3] else "⏳ Регистрация"
+    
+    await message.answer(
+        f"👨‍💼 Панель администратора\n\n"
+        f"Статус турнира: {status}\n"
+        f"Стадия: {settings[4]}",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("admin_"))
+async def admin_actions(callback: types.CallbackQuery):
+    """Обработка действий администратора"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    action = callback.data
+    
+    if action == "admin_stats":
+        stats = get_stats()
+        settings = get_settings()
+        
+        total = sum(stats.values())
+        approved = stats.get('approved', 0)
+        
+        text = "📊 Статистика заявок:\n\n"
+        text += f"✅ Одобрено: {stats.get('approved', 0)}\n"
+        text += f"⏳ На рассмотрении: {stats.get('pending', 0)}\n"
+        text += f"❌ Отклонено: {stats.get('rejected', 0)}\n"
+        text += f"📈 Всего заявок: {total}\n\n"
+        text += f"⚙️ Настройки турнира:\n"
+        text += f"• Лимит команд: {approved}/{settings[0]}\n"
+        text += f"• Игроков в команде: {settings[1]}\n"
+        text += f"• Канал: {settings[2] or 'Не настроен'}\n"
+        text += f"• Статус турнира: {'✅ Запущен' if settings[3] else '⏳ Регистрация'}\n"
+        text += f"• Стадия: {settings[4]}"
+        
+        await callback.message.edit_text(text)
+        
+    elif action == "admin_settings":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Лимит команд", callback_data="set_max_teams")],
+            [InlineKeyboardButton(text="👥 Размер команды", callback_data="set_team_size")],
+            [InlineKeyboardButton(text="📢 Канал для подписки", callback_data="set_channel")],
+            [InlineKeyboardButton(text="◀️ Назад в админ-панель", callback_data="back_to_admin_main")]
+        ])
+        await callback.message.edit_text("⚙️ Настройки турнира:", reply_markup=keyboard)
+        
+    elif action == "admin_manage":
+        admins = get_all_admins()
+        
+        text = "👨‍💼 Список администраторов:\n\n"
+        for admin_id, username in admins:
+            if admin_id == ADMIN_IDS[0]:
+                text += f"👑 ID: {admin_id} | @{username or 'нет'} (Главный админ)\n"
             else:
-                # Только капитан в команде
-                return await self.show_confirmation(update, context)
-            
-        except ValueError:
-            await update.message.reply_text("❌ Пожалуйста, введите число!")
-            return States.PLAYERS.value
-    
-    async def get_player_usernames(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Получение username игроков"""
-        user_id = update.effective_user.id
-        current_player = context.user_data.get("current_player", 1)
-        total_players = context.user_data.get("total_players", 1)
+                text += f"• ID: {admin_id} | @{username or 'нет'}\n"
         
-        username = update.message.text.strip()
-        
-        # Добавляем @ если отсутствует
-        if not username.startswith('@'):
-            username = '@' + username
-        
-        # Сохраняем username
-        context.user_data[f"player_{current_player}_username"] = username
-        
-        # Создаем игрока
-        player = Player(
-            telegram_id=None,  # Пока не привязан
-            username=username,
-            full_name="",  # Без имени
-            device_type=storage.registrations[user_id]["device_type"],
-            contact_confirmed=False
-        )
-        
-        # Назначаем CC/MS для мобильных игроков
-        if player.device_type == "MOBILE":
-            # Четные игроки - MS, нечетные - CC (капитан уже CC)
-            player.cc_ms = "MS" if current_player % 2 == 0 else "CC"
-        
-        storage.registrations[user_id]["players"].append(player)
-        
-        # Переходим к следующему игроку или завершаем
-        if current_player < total_players:
-            context.user_data["current_player"] = current_player + 1
-            
-            await update.message.reply_text(
-                f"✅ Игрок {current_player} добавлен!\n\n"
-                f"🎮 Игрок {current_player + 1} из {total_players}\n"
-                "Введите Telegram username игрока (например, @username):"
-            )
-            return States.PLAYER_USERNAMES.value
-        else:
-            # Все игроки добавлены
-            return await self.show_confirmation(update, context)
-    
-    async def show_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показ подтверждения регистрации"""
-        user_id = update.effective_user.id
-        
-        if user_id not in storage.registrations:
-            await update.message.reply_text("❌ Данные регистрации не найдены!")
-            return ConversationHandler.END
-        
-        reg_data = storage.registrations[user_id]
-        
-        # Формируем текст подтверждения
-        players_text = ""
-        for i, player in enumerate(reg_data["players"], 1):
-            device_info = player.device_type
-            if player.device_type == "MOBILE" and player.cc_ms:
-                device_info = f"{player.device_type} ({player.cc_ms})"
-            
-            contact_status = "✅" if player.contact_confirmed else "⚠️ Не подтвержден"
-            
-            players_text += (
-                f"{i}. {player.username}\n"
-                f"   Устройство: {device_info}\n"
-                f"   Статус: {contact_status}\n\n"
-            )
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_registration"),
-                InlineKeyboardButton("🔄 Изменить", callback_data="edit_registration"),
-                InlineKeyboardButton("❌ Отменить", callback_data="cancel_registration")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        caption = (
-            f"📋 Подтверждение регистрации:\n\n"
-            f"🏆 Название команды: {reg_data['team_name']}\n"
-            f"📱 Тип устройства: {reg_data['device_type']}\n"
-            f"👥 Игроков: {len(reg_data['players'])}/{storage.config['players_per_team']}\n\n"
-            f"Состав команды:\n{players_text}\n"
-            f"⚠️ Внимание: Другие игроки должны подтвердить участие через бота!"
-        )
-        
-        if update.callback_query:
-            await update.callback_query.message.reply_photo(
-                photo=reg_data["photo_id"],
-                caption=caption,
-                reply_markup=reply_markup
-            )
-        else:
-            await update.message.reply_photo(
-                photo=reg_data["photo_id"],
-                caption=caption,
-                reply_markup=reply_markup
-            )
-        
-        return States.CONFIRM_REGISTRATION.value
-    
-    async def confirm_registration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Подтверждение регистрации"""
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        
-        if query.data == "cancel_registration":
-            del storage.registrations[user_id]
-            await query.edit_message_caption(
-                caption="❌ Регистрация отменена.\nНажмите /start чтобы начать заново."
-            )
-            return ConversationHandler.END
-        
-        elif query.data == "edit_registration":
-            await query.edit_message_caption(
-                caption="Редактирование регистрации...\nВведите новое название команды:"
-            )
-            return States.TEAM_NAME.value
-        
-        # Проверяем, есть ли место для новых команд
-        approved_count = len([t for t in storage.teams.values() if t.status == "approved"])
-        if approved_count >= storage.config["max_teams"]:
-            await query.edit_message_caption(
-                caption="❌ Достигнут лимит команд! Регистрация закрыта."
-            )
-            del storage.registrations[user_id]
-            return ConversationHandler.END
-        
-        # Создаем команду
-        reg_data = storage.registrations[user_id]
-        team = Team(
-            name=reg_data["team_name"],
-            photo=reg_data["photo_id"],
-            captain_id=reg_data["captain_id"],
-            captain_username=reg_data["captain_username"],
-            players=reg_data["players"],
-            device_type=reg_data["device_type"]
-        )
-        
-        storage.teams[team.name] = team
-        
-        # Отправляем заявку в админскую группу
-        admin_keyboard = [
-            [
-                InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{team.name}"),
-                InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{team.name}"),
-                InlineKeyboardButton("ℹ️ Подробнее", callback_data=f"info_{team.name}")
-            ]
-        ]
-        admin_reply_markup = InlineKeyboardMarkup(admin_keyboard)
-        
-        # Формируем текст для админов
-        players_list = "\n".join([
-            f"{i+1}. {p.username} - {p.device_type}"
-            f"{' (' + p.cc_ms + ')' if p.cc_ms else ''}"
-            f" - {'✅' if p.contact_confirmed else '⚠️'}"
-            for i, p in enumerate(team.players)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить админа", callback_data="add_admin")],
         ])
         
-        admin_text = (
-            f"📨 НОВАЯ ЗАЯВКА НА ТУРНИР!\n\n"
-            f"🏆 Команда: {team.name}\n"
-            f"📱 Тип устройства: {team.device_type}\n"
-            f"👤 Капитан: {team.captain_username}\n"
-            f"👥 Игроков: {len(team.players)}/{storage.config['players_per_team']}\n"
-            f"📅 Дата подачи: {team.created_at.strftime('%d.%m.%Y %H:%M')}\n\n"
-            f"Состав команды:\n{players_list}"
+        # Только главный админ может удалять админов
+        if is_main_admin(callback.from_user.id) and len(admins) > 1:
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text="➖ Удалить админа", callback_data="remove_admin")])
+        
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад в админ-панель", callback_data="back_to_admin_main")])
+        
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        
+    elif action == "admin_applications":
+        apps = cursor.execute(
+            "SELECT id, team_name, status, full_name, created_at FROM applications ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        
+        if not apps:
+            await callback.message.edit_text("📭 Заявок пока нет.")
+            return
+        
+        text = "📋 Последние заявки:\n\n"
+        for app_id, team_name, status, full_name, created_at in apps:
+            status_icon = "✅" if status == 'approved' else "⏳" if status == 'pending' else "❌"
+            date_str = created_at[:10] if created_at else ""
+            text += f"{status_icon} #{app_id} | {team_name[:15]} | {full_name[:10]} | {date_str}\n"
+        
+        await callback.message.edit_text(text)
+        
+    elif action == "admin_broadcast":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Всем пользователям", callback_data="broadcast_all")],
+            [InlineKeyboardButton(text="✅ Только одобренным", callback_data="broadcast_approved")],
+            [InlineKeyboardButton(text="⏳ Только ожидающим", callback_data="broadcast_pending")],
+            [InlineKeyboardButton(text="◀️ Назад в админ-панель", callback_data="back_to_admin_main")]
+        ])
+        await callback.message.edit_text("📢 Выберите кому отправить рассылку:", reply_markup=keyboard)
+        
+    elif action == "admin_tournament":
+        settings = get_settings()
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+        
+        if not settings[3]:  # Если турнир не начат
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text="▶️ Начать турнир", callback_data="start_tournament")])
+        else:
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить сетку", callback_data="update_bracket")])
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text="📊 Показать сетку", callback_data="show_bracket_admin")])
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text="🛑 Завершить турнир", callback_data="end_tournament")])
+        
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад в админ-панель", callback_data="back_to_admin_main")])
+        
+        status_text = "✅ Турнир запущен" if settings[3] else "⏳ Ожидание запуска"
+        
+        await callback.message.edit_text(
+            f"🏆 Управление турниром\n\n"
+            f"Статус: {status_text}\n"
+            f"Стадия: {settings[4]}\n\n"
+            f"Выберите действие:",
+            reply_markup=keyboard
         )
         
+    elif action == "back_to_admin_main":
+        # Возврат в главное меню админ-панели
+        await admin_panel(callback.message)
+
+# ========== ОБРАБОТЧИКИ КНОПОК ТУРНИРА ==========
+@dp.callback_query(F.data == "start_tournament")
+async def start_tournament_handler(callback: types.CallbackQuery):
+    """Запуск турнира"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    settings = get_settings()
+    stats = get_stats()
+    approved = stats.get('approved', 0)
+    
+    if approved < 2:
+        await callback.answer("❌ Нужно минимум 2 команды для начала турнира!", show_alert=True)
+        return
+    
+    # Создаем турнирную сетку
+    groups = create_tournament_bracket()
+    
+    if not groups:
+        await callback.answer("❌ Ошибка создания турнирной сетки!", show_alert=True)
+        return
+    
+    # Запускаем турнир
+    start_tournament()
+    
+    # Формируем сообщение с сеткой
+    text = "🎉 ТУРНИР НАЧАЛСЯ! 🎉\n\n"
+    text += "══════════════════════════\n"
+    text += "🏆 ТУРНИРНАЯ СЕТКА\n"
+    text += "══════════════════════════\n\n"
+    
+    for group_num in sorted(groups.keys()):
+        text += f"📊 ГРУППА {group_num}:\n"
+        text += "----------------\n"
+        
+        for i, team in enumerate(groups[group_num], 1):
+            text += f"{i}. {team[1]}\n"
+        
+        text += "\n"
+    
+    text += "Удачи всем участникам! 🍀"
+    
+    # Отправляем в группу админов
+    await bot.send_message(
+        chat_id=GROUP_ID,
+        text=text,
+        parse_mode='HTML'
+    )
+    
+    # Уведомляем всех участников
+    users = cursor.execute("SELECT DISTINCT user_id FROM applications WHERE status='approved'").fetchall()
+    
+    for user_id in users:
         try:
-            # Отправляем в админскую группу
-            await context.bot.send_photo(
-                chat_id=ADMIN_GROUP_ID,
-                photo=team.photo,
-                caption=admin_text,
-                reply_markup=admin_reply_markup
+            await bot.send_message(
+                chat_id=user_id[0],
+                text="🎉 Турнир начался! Проверьте турнирную сетку в боте командой /start"
+            )
+        except:
+            pass
+    
+    await callback.message.edit_text(
+        f"✅ Турнир успешно запущен!\n\n"
+        f"Создано групп: {len(groups)}\n"
+        f"Всего команд: {approved}\n\n"
+        f"Сетка отправлена в группу админов."
+    )
+
+@dp.callback_query(F.data == "update_bracket")
+async def update_bracket_handler(callback: types.CallbackQuery):
+    """Обновление турнирной сетки"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    groups = create_tournament_bracket()
+    
+    if not groups:
+        await callback.answer("❌ Ошибка создания турнирной сетки!", show_alert=True)
+        return
+    
+    text = "🔄 ТУРНИРНАЯ СЕТКА ОБНОВЛЕНА\n\n"
+    text += "══════════════════════════\n"
+    text += "🏆 НОВАЯ ТУРНИРНАЯ СЕТКА\n"
+    text += "══════════════════════════\n\n"
+    
+    for group_num in sorted(groups.keys()):
+        text += f"📊 ГРУППА {group_num}:\n"
+        text += "----------------\n"
+        
+        for i, team in enumerate(groups[group_num], 1):
+            text += f"{i}. {team[1]}\n"
+        
+        text += "\n"
+    
+    # Отправляем в группу админов
+    await bot.send_message(
+        chat_id=GROUP_ID,
+        text=text,
+        parse_mode='HTML'
+    )
+    
+    await callback.message.edit_text("✅ Турнирная сетка обновлена и отправлена в группу!")
+
+@dp.callback_query(F.data == "show_bracket_admin")
+async def show_bracket_admin(callback: types.CallbackQuery):
+    """Показать турнирную сетку админам"""
+    groups = get_tournament_bracket()
+    
+    if not groups:
+        await callback.answer("❌ Турнирная сетка ещё не создана!", show_alert=True)
+        return
+    
+    text = "🏆 ТУРНИРНАЯ СЕТКА 🏆\n\n"
+    
+    for group_num in sorted(groups.keys()):
+        text += f"════════════════════\n"
+        text += f"📊 ГРУППА {group_num}:\n"
+        text += f"════════════════════\n"
+        
+        for team in groups[group_num]:
+            text += f"{team[1]}. {team[2]} (капитан: {team[3]})\n"
+        
+        text += "\n"
+    
+    await callback.message.edit_text(text)
+
+@dp.callback_query(F.data == "end_tournament")
+async def end_tournament_handler(callback: types.CallbackQuery):
+    """Завершение турнира"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="❌ Нет", callback_data="cancel_end"),
+            InlineKeyboardButton(text="✅ Да, завершить", callback_data="confirm_end")
+        ]
+    ])
+    
+    await callback.message.edit_text(
+        "⚠️ Вы уверены, что хотите завершить турнир?\n\n"
+        "Это сбросит все турнирные данные (группы, позиции) "
+        "и переведет турнир обратно в стадию регистрации.",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "confirm_end")
+async def confirm_end_tournament(callback: types.CallbackQuery):
+    """Подтверждение завершения турнира"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    reset_tournament()
+    
+    # Уведомляем в группу
+    await bot.send_message(
+        chat_id=GROUP_ID,
+        text="🛑 ТУРНИР ЗАВЕРШЕН\n\n"
+             "Все турнирные данные сброшены.\n"
+             "Турнир переведен в стадию регистрации."
+    )
+    
+    await callback.message.edit_text("✅ Турнир завершен! Все данные сброшены.")
+
+@dp.callback_query(F.data == "cancel_end")
+async def cancel_end_tournament(callback: types.CallbackQuery):
+    """Отмена завершения турнира"""
+    await callback.message.delete()
+    await admin_panel(callback.message)
+
+# ========== РАССЫЛКА СООБЩЕНИЙ ==========
+@dp.callback_query(F.data.startswith("broadcast_"))
+async def broadcast_select(callback: types.CallbackQuery, state: FSMContext):
+    """Выбор типа рассылки"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    broadcast_type = callback.data.replace("broadcast_", "")
+    
+    await state.update_data(broadcast_type=broadcast_type)
+    await callback.message.edit_text(
+        "Введите сообщение для рассылки:\n\n"
+        "Можно использовать HTML разметку:\n"
+        "<b>жирный</b>\n"
+        "<i>курсив</i>\n"
+        "<u>подчеркнутый</u>\n"
+        "<code>моноширинный</code>"
+    )
+    await state.set_state(AdminStates.waiting_broadcast_message)
+
+@dp.message(AdminStates.waiting_broadcast_message)
+async def process_broadcast_message(message: types.Message, state: FSMContext):
+    """Обработка сообщения для рассылки"""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    broadcast_type = data.get('broadcast_type', 'all')
+    
+    # Определяем кому отправлять
+    if broadcast_type == 'approved':
+        users = cursor.execute("SELECT DISTINCT user_id FROM applications WHERE status='approved'").fetchall()
+    elif broadcast_type == 'pending':
+        users = cursor.execute("SELECT DISTINCT user_id FROM applications WHERE status='pending'").fetchall()
+    else:
+        users = cursor.execute("SELECT DISTINCT user_id FROM applications").fetchall()
+    
+    users = [user[0] for user in users]
+    
+    if not users:
+        await message.answer("❌ Нет пользователей для рассылки.")
+        await state.clear()
+        return
+    
+    await state.update_data(broadcast_message=message.text, broadcast_users=users)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_broadcast"),
+            InlineKeyboardButton(text="✅ Отправить", callback_data="confirm_broadcast")
+        ]
+    ])
+    
+    await message.answer(
+        f"📢 Подтвердите рассылку:\n\n"
+        f"Получателей: {len(users)}\n"
+        f"Тип: {broadcast_type}\n\n"
+        f"Сообщение:\n{message.text[:200]}...",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "confirm_broadcast")
+async def confirm_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    """Подтверждение рассылки"""
+    if not is_admin(callback.from_user.id):
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    message_text = data.get('broadcast_message', '')
+    users = data.get('broadcast_users', [])
+    
+    if not users or not message_text:
+        await callback.answer("❌ Ошибка данных рассылки", show_alert=True)
+        await state.clear()
+        return
+    
+    # Отправляем сообщение
+    success = 0
+    failed = 0
+    
+    await callback.message.edit_text(f"📤 Отправка рассылки...\n0/{len(users)}")
+    
+    for i, user_id in enumerate(users):
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=message_text,
+                parse_mode='HTML'
+            )
+            success += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
+        
+        # Обновляем статус каждые 10 сообщений
+        if i % 10 == 0:
+            await callback.message.edit_text(
+                f"📤 Отправка рассылки...\n{i+1}/{len(users)}\n"
+                f"✅ Успешно: {success}\n"
+                f"❌ Ошибок: {failed}"
+            )
+    
+    await callback.message.edit_text(
+        f"✅ Рассылка завершена!\n\n"
+        f"📊 Статистика:\n"
+        f"• Всего получателей: {len(users)}\n"
+        f"• Успешно отправлено: {success}\n"
+        f"• Ошибок: {failed}"
+    )
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "cancel_broadcast")
+async def cancel_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    """Отмена рассылки"""
+    await callback.message.edit_text("❌ Рассылка отменена.")
+    await state.clear()
+
+# ========== НАСТРОЙКИ АДМИНА ==========
+@dp.callback_query(F.data == "set_max_teams")
+async def ask_max_teams(callback: types.CallbackQuery, state: FSMContext):
+    """Запрос нового лимита команд"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await callback.message.edit_text(
+        "Введите новое максимальное количество команд (число):\n\n"
+        "Пример: 16"
+    )
+    await state.set_state(AdminStates.waiting_max_teams)
+
+@dp.message(AdminStates.waiting_max_teams)
+async def set_max_teams_value(message: types.Message, state: FSMContext):
+    """Установка нового лимита команд"""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    try:
+        max_teams = int(message.text)
+        if max_teams < 2:
+            await message.answer("❌ Минимум 2 команды для турнира!")
+            return
+        
+        cursor.execute(
+            "UPDATE tournament_settings SET max_teams=? WHERE id=1",
+            (max_teams,)
+        )
+        conn.commit()
+        
+        await message.answer(f"✅ Лимит команд установлен: {max_teams}")
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число!")
+        return
+
+@dp.callback_query(F.data == "set_team_size")
+async def ask_team_size(callback: types.CallbackQuery, state: FSMContext):
+    """Запрос нового размера команды"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await callback.message.edit_text(
+        "Введите новое количество игроков в команде (число):\n\n"
+        "Пример: 5"
+    )
+    await state.set_state(AdminStates.waiting_team_size)
+
+@dp.message(AdminStates.waiting_team_size)
+async def set_team_size_value(message: types.Message, state: FSMContext):
+    """Установка нового размера команды"""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    try:
+        team_size = int(message.text)
+        if team_size < 1:
+            raise ValueError
+        
+        cursor.execute(
+            "UPDATE tournament_settings SET team_size=? WHERE id=1",
+            (team_size,)
+        )
+        conn.commit()
+        
+        await message.answer(f"✅ Размер команды установлен: {team_size}")
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное положительное число!")
+        return
+
+@dp.callback_query(F.data == "set_channel")
+async def ask_channel_username(callback: types.CallbackQuery, state: FSMContext):
+    """Запрос юзернейма канала"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await callback.message.edit_text(
+        "Введите юзернейм канала для подписки:\n\n"
+        "Пример: @my_channel\n"
+        "Или отправьте '0' чтобы отключить проверку подписки"
+    )
+    await state.set_state(AdminStates.waiting_channel_username)
+
+@dp.message(AdminStates.waiting_channel_username)
+async def set_channel_username(message: types.Message, state: FSMContext):
+    """Установка юзернейма канала"""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    channel_username = message.text.strip()
+    
+    if channel_username == '0':
+        channel_username = ''
+        response = "✅ Проверка подписки отключена"
+    elif not channel_username.startswith('@'):
+        await message.answer("❌ Юзернейм должен начинаться с @")
+        return
+    else:
+        response = f"✅ Канал установлен: {channel_username}"
+    
+    cursor.execute(
+        "UPDATE tournament_settings SET channel_username=? WHERE id=1",
+        (channel_username,)
+    )
+    conn.commit()
+    
+    await message.answer(response)
+    await state.clear()
+
+# ========== УПРАВЛЕНИЕ АДМИНАМИ ==========
+@dp.callback_query(F.data == "add_admin")
+async def ask_admin_id(callback: types.CallbackQuery, state: FSMContext):
+    """Запрос ID нового администратора"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await callback.message.edit_text(
+        "Введите ID пользователя, которого хотите сделать администратором:\n\n"
+        "ID можно узнать у @getmyid_bot"
+    )
+    await state.set_state(AdminStates.waiting_admin_id)
+
+@dp.message(AdminStates.waiting_admin_id)
+async def add_admin_id(message: types.Message, state: FSMContext):
+    """Добавление нового администратора"""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    
+    try:
+        new_admin_id = int(message.text)
+        
+        # Проверяем, не является ли уже админом
+        if is_admin(new_admin_id):
+            await message.answer("❌ Этот пользователь уже администратор!")
+            return
+        
+        # Добавляем админа
+        cursor.execute(
+            "INSERT OR REPLACE INTO admins (user_id, username) VALUES (?, ?)",
+            (new_admin_id, message.from_user.username)
+        )
+        conn.commit()
+        
+        await message.answer(f"✅ Пользователь {new_admin_id} добавлен в администраторы")
+        
+        # Уведомляем нового админа
+        try:
+            await bot.send_message(
+                chat_id=new_admin_id,
+                text="🎉 Вас добавили в администраторы бота!\n\n"
+                     "Используйте команду /admin для доступа к панели управления."
+            )
+        except:
+            pass
+        
+    except ValueError:
+        await message.answer("❌ Введите корректный ID (число)!")
+        return
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "remove_admin")
+async def ask_remove_admin(callback: types.CallbackQuery):
+    """Запрос на удаление администратора"""
+    if not is_main_admin(callback.from_user.id):
+        await callback.answer("❌ Только главный админ может удалять админов!", show_alert=True)
+        return
+    
+    admins = get_all_admins()
+    
+    if len(admins) <= 1:
+        await callback.answer("❌ Нельзя удалить последнего администратора!", show_alert=True)
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for admin_id, username in admins:
+        if admin_id != callback.from_user.id:  # Нельзя удалить себя
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"ID: {admin_id} | @{username or 'нет'}",
+                    callback_data=f"remove_admin_{admin_id}"
+                )
+            ])
+    
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад в админ-панель", callback_data="back_to_admin_main")])
+    
+    await callback.message.edit_text(
+        "Выберите администратора для удаления:",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("remove_admin_"))
+async def remove_admin(callback: types.CallbackQuery):
+    """Удаление администратора"""
+    if not is_main_admin(callback.from_user.id):
+        return
+    
+    admin_id = int(callback.data.split("_")[2])
+    
+    # Нельзя удалить главного админа
+    if admin_id == ADMIN_IDS[0]:
+        await callback.answer("❌ Нельзя удалить главного администратора!", show_alert=True)
+        return
+    
+    cursor.execute("DELETE FROM admins WHERE user_id=?", (admin_id,))
+    conn.commit()
+    
+    await callback.message.edit_text(f"✅ Администратор {admin_id} удалён")
+    await callback.answer()
+
+# ========== МОДЕРАЦИЯ ЗАЯВОК В ГРУППЕ ==========
+@dp.callback_query(F.data.startswith(("approve_", "reject_")))
+async def moderate_application(callback: types.CallbackQuery):
+    """Одобрение или отклонение заявки"""
+    # Проверяем, что это сообщение из группы модерации
+    if callback.message.chat.id != GROUP_ID:
+        return
+    
+    # Разбираем callback data
+    action, app_id = callback.data.split('_')
+    app_id = int(app_id)
+    
+    # Получаем заявку
+    app = cursor.execute(
+        "SELECT user_id, team_name, status, full_name, contact FROM applications WHERE id=?", 
+        (app_id,)
+    ).fetchone()
+    
+    if not app:
+        await callback.answer("Заявка не найдена!", show_alert=True)
+        return
+    
+    if app[2] != 'pending':
+        await callback.answer("Заявка уже обработана!", show_alert=True)
+        return
+    
+    settings = get_settings()
+    
+    if action == 'approve':
+        # Проверяем лимит команд
+        stats = get_stats()
+        approved = stats.get('approved', 0)
+        
+        if approved >= settings[0]:
+            await callback.answer("❌ Достигнут лимит команд!", show_alert=True)
+            return
+        
+        # Одобряем заявку
+        cursor.execute(
+            "UPDATE applications SET status='approved' WHERE id=?", 
+            (app_id,)
+        )
+        conn.commit()
+        
+        # Проверяем, достигнут ли лимит команд для автоматического старта турнира
+        stats = get_stats()
+        approved = stats.get('approved', 0)
+        
+        if approved >= settings[0] and not settings[3]:
+            # Автоматически начинаем турнир при заполнении лимита
+            groups = create_tournament_bracket()
+            start_tournament()
+            
+            # Отправляем уведомление в группу
+            await bot.send_message(
+                chat_id=GROUP_ID,
+                text=f"🎉 ЛИМИТ КОМАНД ДОСТИГНУТ!\n\n"
+                     f"✅ Одобрено команд: {approved}/{settings[0]}\n"
+                     f"🏆 Турнир автоматически запущен!\n\n"
+                     f"Турнирная сетка сформирована."
+            )
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(
+                chat_id=app[0],
+                text=f"🎉 Поздравляем! Ваша заявка одобрена!\n\n"
+                     f"🏷️ Команда: {app[1]}\n"
+                     f"👤 Капитан: {app[3]}\n\n"
+                     f"Ожидайте дальнейших инструкций."
             )
         except Exception as e:
-            logger.error(f"Ошибка отправки в админ-группу: {e}")
+            logger.error(f"Ошибка уведомления пользователя: {e}")
         
-        # Отправляем уведомления игрокам (кроме капитана)
-        for i, player in enumerate(team.players[1:], 2):
-            confirm_keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "✅ Подтвердить участие", 
-                        callback_data=f"player_confirm_{team.name}_{i}"
-                    ),
-                    InlineKeyboardButton(
-                        "❌ Отказаться", 
-                        callback_data=f"player_decline_{team.name}_{i}"
-                    )
-                ]
-            ]
-            confirm_markup = InlineKeyboardMarkup(confirm_keyboard)
-            
-            try:
-                # Отправляем сообщение с кнопкой подтверждения
-                # Игрок должен нажать кнопку для подтверждения
-                sent_message = await context.bot.send_message(
-                    chat_id=team.captain_id,  # Отправляем капитану для теста
-                    text=(
-                        f"📨 Уведомление для игрока {player.username}:\n\n"
-                        f"Вас добавили в команду '{team.name}' для участия в турнире!\n\n"
-                        f"Капитан: {team.captain_username}\n"
-                        f"Ваше устройство: {player.device_type}"
-                        f"{' (' + player.cc_ms + ')' if player.cc_ms else ''}\n\n"
-                        f"Пожалуйста, подтвердите свое участие нажав кнопку ниже:"
-                    ),
-                    reply_markup=confirm_markup
-                )
-                
-                # Сохраняем message_id для возможности удаления/редактирования
-                context.user_data[f"notify_msg_{team.name}_{i}"] = sent_message.message_id
-                
-            except Exception as e:
-                logger.error(f"Ошибка отправки уведомления игроку {player.username}: {e}")
-        
-        await query.edit_message_caption(
-            caption=(
-                "✅ Заявка отправлена на модерацию!\n\n"
-                f"Команда: {team.name}\n"
-                "Статус: ⏳ На рассмотрении\n\n"
-                "Уведомления отправлены другим игрокам."
-            )
+        # Обновляем сообщение в группе
+        await callback.message.edit_text(
+            f"✅ ЗАЯВКА ОДОБРЕНА #{app_id}\n\n"
+            f"👤 Игрок: {app[3]}\n"
+            f"📱 Контакт: {app[4]}\n"
+            f"🏷️ Команда: {app[1]}\n\n"
+            f"Статус: ✅ Одобрено\n"
+            f"Всего одобрено: {stats.get('approved', 0) + 1}/{settings[0]}"
         )
         
-        del storage.registrations[user_id]
-        self.save_data()
-        return ConversationHandler.END
-    
-    async def player_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Подтверждение участия игроком"""
-        query = update.callback_query
-        await query.answer()
+        await callback.answer("✅ Заявка одобрена!")
         
-        _, action, team_name, player_idx = query.data.split('_')
-        player_idx = int(player_idx) - 1  # Переводим в 0-based индекс
-        
-        if team_name not in storage.teams:
-            await query.edit_message_text("❌ Команда не найдена!")
-            return
-        
-        team = storage.teams[team_name]
-        
-        if player_idx >= len(team.players):
-            await query.edit_message_text("❌ Игрок не найден!")
-            return
-        
-        player = team.players[player_idx]
-        
-        if action == "confirm":
-            # Привязываем Telegram ID игрока
-            player.telegram_id = query.from_user.id
-            player.contact_confirmed = True
-            
-            await query.edit_message_text(
-                f"✅ Вы подтвердили участие в команде '{team.name}'!\n\n"
-                f"Ваше устройство: {player.device_type}"
-                f"{' (' + player.cc_ms + ')' if player.cc_ms else ''}\n\n"
-                f"Ожидайте подтверждения команды администратором."
-            )
-            
-            # Уведомляем капитана
-            try:
-                await context.bot.send_message(
-                    chat_id=team.captain_id,
-                    text=f"✅ Игрок {player.username} подтвердил участие в команде!"
-                )
-            except Exception as e:
-                logger.error(f"Ошибка уведомления капитана: {e}")
-                
-        elif action == "decline":
-            # Удаляем игрока из команды
-            team.players.pop(player_idx)
-            
-            await query.edit_message_text(
-                "❌ Вы отказались от участия в команде."
-            )
-            
-            # Уведомляем капитана
-            try:
-                await context.bot.send_message(
-                    chat_id=team.captain_id,
-                    text=f"❌ Игрок {player.username} отказался от участия в команде!"
-                )
-            except Exception as e:
-                logger.error(f"Ошибка уведомления капитана: {e}")
-        
-        self.save_data()
-    
-    async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Панель администратора"""
-        user_id = update.effective_user.id
-        
-        if not await self.is_admin(user_id):
-            await update.message.reply_text("❌ Эта команда только для администраторов!")
-            return
-        
-        keyboard = [
-            [InlineKeyboardButton("⚙️ Настройки турнира", callback_data="admin_settings")],
-            [InlineKeyboardButton("👥 Управление админами", callback_data="admin_manage")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-            [InlineKeyboardButton("🎮 Управление командами", callback_data="admin_teams")],
-            [InlineKeyboardButton("🔧 Дополнительные функции", callback_data="admin_tools")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        approved_count = len([t for t in storage.teams.values() if t.status == "approved"])
-        pending_count = len([t for t in storage.teams.values() if t.status == "pending"])
-        
-        await update.message.reply_text(
-            f"👑 Панель администратора\n\n"
-            f"📈 Статистика:\n"
-            f"• Всего команд: {len(storage.teams)}\n"
-            f"• Одобрено: {approved_count}\n"
-            f"• На рассмотрении: {pending_count}\n"
-            f"• Лимит команд: {storage.config['max_teams']}\n"
-            f"• Свободно мест: {storage.config['max_teams'] - approved_count}\n"
-            f"• Игроков в команде: {storage.config['players_per_team']}\n"
-            f"• Регистрация: {'✅ Открыта' if storage.config['registration_open'] else '❌ Закрыта'}\n"
-            f"• Сетка: {'✅ Сгенерирована' if storage.config['brackets_generated'] else '❌ Не сгенерирована'}",
-            reply_markup=reply_markup
+    else:  # reject
+        # Отклоняем заявку
+        cursor.execute(
+            "UPDATE applications SET status='rejected' WHERE id=?", 
+            (app_id,)
         )
-    
-    async def admin_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Меню настроек турнира"""
-        query = update.callback_query
-        await query.answer()
+        conn.commit()
         
-        keyboard = [
-            [
-                InlineKeyboardButton("📊 Максимум команд", callback_data="setting_max_teams"),
-                InlineKeyboardButton("👥 Игроков в команде", callback_data="setting_players_per_team")
-            ],
-            [
-                InlineKeyboardButton("🔓 Открыть регистрацию", callback_data="setting_open_reg"),
-                InlineKeyboardButton("🔒 Закрыть регистрацию", callback_data="setting_close_reg")
-            ],
-            [
-                InlineKeyboardButton("🎮 Сгенерировать сетку", callback_data="setting_generate_brackets"),
-                InlineKeyboardButton("📢 Опубликовать в канал", callback_data="setting_post_channel")
-            ],
-            [InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "⚙️ Настройки турнира:\n\n"
-            f"1. Максимум команд: {storage.config['max_teams']}\n"
-            f"2. Игроков в команде: {storage.config['players_per_team']}\n"
-            f"3. Регистрация: {'✅ Открыта' if storage.config['registration_open'] else '❌ Закрыта'}\n"
-            f"4. Сетка сгенерирована: {'✅ Да' if storage.config['brackets_generated'] else '❌ Нет'}\n"
-            f"5. ID канала: {storage.config['notification_channel']}",
-            reply_markup=reply_markup
-        )
-    
-    async def admin_manage_admins(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Управление администраторами"""
-        query = update.callback_query
-        await query.answer()
-        
-        keyboard = [
-            [InlineKeyboardButton("➕ Добавить админа", callback_data="admin_add")],
-            [InlineKeyboardButton("➖ Удалить админа", callback_data="admin_remove")],
-            [InlineKeyboardButton("📋 Список админов", callback_data="admin_list")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        admin_list = "\n".join([f"• {admin_id}" for admin_id in storage.admins])
-        
-        await query.edit_message_text(
-            "👥 Управление администраторами\n\n"
-            f"Всего админов: {len(storage.admins)}\n\n"
-            f"Список админов:\n{admin_list}",
-            reply_markup=reply_markup
-        )
-    
-    async def admin_add_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Добавление администратора"""
-        query = update.callback_query
-        await query.answer()
-        
-        await query.edit_message_text(
-            "➕ Добавление администратора\n\n"
-            "Отправьте мне:\n"
-            "1. User ID пользователя (цифры)\n"
-            "2. Или перешлите сообщение от пользователя\n\n"
-            "Для отмены отправьте /cancel"
-        )
-        
-        return States.ADMIN_ADD_ADMIN.value
-    
-    async def process_add_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка добавления админа"""
-        user_id = update.effective_user.id
-        
-        if update.message.text == '/cancel':
-            await update.message.reply_text("❌ Добавление админа отменено.")
-            return ConversationHandler.END
-        
-        # Пытаемся получить ID пользователя
-        target_user_id = None
-        
-        if update.message.forward_from:
-            # Если переслано сообщение
-            target_user_id = update.message.forward_from.id
-            username = update.message.forward_from.username or "без username"
-            
-        elif update.message.text and update.message.text.isdigit():
-            # Если введен ID
-            target_user_id = int(update.message.text)
-            username = f"ID {target_user_id}"
-            
-        if target_user_id:
-            success = await self.add_admin(target_user_id)
-            if success:
-                await update.message.reply_text(f"✅ Пользователь {username} (ID: {target_user_id}) добавлен в админы!")
-            else:
-                await update.message.reply_text("⚠️ Этот пользователь уже является админом!")
-        else:
-            await update.message.reply_text(
-                "❌ Не удалось определить ID пользователя.\n"
-                "Попробуйте еще раз или отправьте /cancel"
-            )
-            return States.ADMIN_ADD_ADMIN.value
-        
-        self.save_data()
-        return ConversationHandler.END
-    
-    async def admin_change_setting(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Изменение настроек турнира"""
-        query = update.callback_query
-        await query.answer()
-        
-        setting = query.data.replace("setting_", "")
-        
-        if setting == "max_teams":
-            await query.edit_message_text(
-                "Введите новое максимальное количество команд:"
-            )
-            return States.ADMIN_TEAM_LIMIT.value
-            
-        elif setting == "players_per_team":
-            await query.edit_message_text(
-                "Введите новое количество игроков в команде:"
-            )
-            return States.ADMIN_PLAYER_LIMIT.value
-            
-        elif setting == "open_reg":
-            storage.config["registration_open"] = True
-            await query.edit_message_text("✅ Регистрация открыта!")
-            
-        elif setting == "close_reg":
-            storage.config["registration_open"] = False
-            await query.edit_message_text("❌ Регистрация закрыта!")
-            
-        elif setting == "generate_brackets":
-            await self.generate_brackets(query, context)
-            
-        elif setting == "post_channel":
-            await self.post_to_channel(query, context)
-            
-        self.save_data()
-    
-    async def process_team_limit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка изменения лимита команд"""
+        # Уведомляем пользователя
         try:
-            max_teams = int(update.message.text)
-            
-            if max_teams < 2:
-                await update.message.reply_text("❌ Минимум 2 команды!")
-                return States.ADMIN_TEAM_LIMIT.value
-            
-            # Проверяем, не меньше ли текущее количество одобренных команд
-            approved_count = len([t for t in storage.teams.values() if t.status == "approved"])
-            if max_teams < approved_count:
-                await update.message.reply_text(
-                    f"❌ Нельзя установить меньше {approved_count} команд "
-                    f"(столько уже одобрено)!"
-                )
-                return States.ADMIN_TEAM_LIMIT.value
-            
-            storage.config["max_teams"] = max_teams
-            self.save_data()
-            
-            await update.message.reply_text(
-                f"✅ Максимальное количество команд установлено: {max_teams}"
-            )
-            
-        except ValueError:
-            await update.message.reply_text("❌ Пожалуйста, введите число!")
-            return States.ADMIN_TEAM_LIMIT.value
-        
-        return ConversationHandler.END
-    
-    async def process_player_limit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка изменения лимита игроков"""
-        try:
-            players_per_team = int(update.message.text)
-            
-            if players_per_team < 2:
-                await update.message.reply_text("❌ Минимум 2 игрока в команде!")
-                return States.ADMIN_PLAYER_LIMIT.value
-            
-            storage.config["players_per_team"] = players_per_team
-            self.save_data()
-            
-            await update.message.reply_text(
-                f"✅ Количество игроков в команде установлено: {players_per_team}"
-            )
-            
-        except ValueError:
-            await update.message.reply_text("❌ Пожалуйста, введите число!")
-            return States.ADMIN_PLAYER_LIMIT.value
-        
-        return ConversationHandler.END
-    
-    async def generate_brackets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Генерация сетки турнира"""
-        if isinstance(update, Update):
-            message = update.message
-        else:
-            message = update
-        
-        approved_teams = [team for team in storage.teams.values() if team.status == "approved"]
-        
-        if len(approved_teams) < 2:
-            if hasattr(message, 'reply_text'):
-                await message.reply_text("❌ Недостаточно команд для генерации сетки!")
-            else:
-                await message.edit_message_text("❌ Недостаточно команд для генерации сетки!")
-            return
-        
-        if storage.config["brackets_generated"]:
-            if hasattr(message, 'reply_text'):
-                await message.reply_text("⚠️ Сетка уже сгенерирована!")
-            else:
-                await message.edit_message_text("⚠️ Сетка уже сгенерирована!")
-            return
-        
-        # Закрываем регистрацию
-        storage.config["registration_open"] = False
-        
-        # Перемешиваем команды
-        random.shuffle(approved_teams)
-        
-        # Создаем пары
-        storage.matches.clear()
-        for i in range(0, len(approved_teams), 2):
-            if i + 1 < len(approved_teams):
-                match = {
-                    "team1": approved_teams[i].name,
-                    "team2": approved_teams[i + 1].name,
-                    "round": 1,
-                    "winner": None
-                }
-                storage.matches.append(match)
-        
-        storage.config["brackets_generated"] = True
-        self.save_data()
-        
-        # Формируем текст сетки
-        brackets_text = "🎮 ТУРНИРНАЯ СЕТКА СГЕНЕРИРОВАНА!\n\n"
-        brackets_text += f"Всего команд: {len(approved_teams)}\n\n"
-        
-        for idx, match in enumerate(storage.matches, 1):
-            team1 = storage.teams[match['team1']]
-            team2 = storage.teams[match['team2']]
-            
-            brackets_text += (
-                f"⚔️ МАТЧ {idx}:\n"
-                f"   {team1.name} ({team1.device_type})\n"
-                f"   vs\n"
-                f"   {team2.name} ({team2.device_type})\n\n"
-            )
-        
-        brackets_text += "🎯 Удачи всем участникам!"
-        
-        # Отправляем всем капитанам
-        for team in approved_teams:
-            try:
-                await context.bot.send_message(
-                    chat_id=team.captain_id,
-                    text=(
-                        f"🎉 Турнирная сетка сгенерирована!\n\n"
-                        f"Регистрация закрыта.\n"
-                        f"{brackets_text}"
-                    )
-                )
-            except Exception as e:
-                logger.error(f"Ошибка отправки капитану {team.name}: {e}")
-        
-        # Публикуем в канал
-        try:
-            await context.bot.send_message(
-                chat_id=NOTIFICATION_CHANNEL_ID,
-                text=brackets_text
+            await bot.send_message(
+                chat_id=app[0],
+                text=f"❌ К сожалению, ваша заявка отклонена.\n\n"
+                     f"🏷️ Команда: {app[1]}\n\n"
+                     f"Вы можете подать новую заявку."
             )
         except Exception as e:
-            logger.error(f"Ошибка отправки в канал: {e}")
+            logger.error(f"Ошибка уведомления пользователя: {e}")
         
-        if hasattr(message, 'reply_text'):
-            await message.reply_text(
-                f"✅ Сетка турнира сгенерирована!\n\n"
-                f"Уведомления отправлены всем капитанам и опубликованы в канал.\n\n"
-                f"{brackets_text}"
-            )
-        else:
-            await message.edit_message_text(
-                f"✅ Сетка турнира сгенерирована!\n\n"
-                f"Уведомления отправлены всем капитанам и опубликованы в канал.\n\n"
-                f"{brackets_text}"
-            )
-    
-    async def post_to_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Публикация информации в канал"""
-        query = update.callback_query
-        await query.answer()
-        
-        approved_teams = [team for team in storage.teams.values() if team.status == "approved"]
-        
-        if not approved_teams:
-            await query.edit_message_text("❌ Нет одобренных команд для публикации!")
-            return
-        
-        # Формируем текст для канала
-        channel_text = "🏆 ТУРНИР - УЧАСТНИКИ\n\n"
-        channel_text += f"Всего команд: {len(approved_teams)}\n\n"
-        
-        for i, team in enumerate(approved_teams, 1):
-            confirmed_players = len([p for p in team.players if p.contact_confirmed])
-            
-            channel_text += (
-                f"{i}. {team.name}\n"
-                f"   Устройство: {team.device_type}\n"
-                f"   Игроков: {confirmed_players}/{len(team.players)}\n"
-                f"   Капитан: {team.captain_username}\n\n"
-            )
-        
-        # Отправляем в канал
-        try:
-            await context.bot.send_message(
-                chat_id=NOTIFICATION_CHANNEL_ID,
-                text=channel_text
-            )
-            await query.edit_message_text(
-                f"✅ Информация опубликована в канал!\n\n"
-                f"{channel_text}"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка отправки в канал: {e}")
-            await query.edit_message_text("❌ Ошибка публикации в канал!")
-    
-    async def admin_stats_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Подробная статистика"""
-        query = update.callback_query
-        await query.answer()
-        
-        approved_teams = [t for t in storage.teams.values() if t.status == "approved"]
-        pending_teams = [t for t in storage.teams.values() if t.status == "pending"]
-        
-        # Статистика по устройствам
-        pc_count = len([t for t in approved_teams if t.device_type == "PC"])
-        mobile_count = len([t for t in approved_teams if t.device_type == "MOBILE"])
-        
-        # Статистика по подтвержденным игрокам
-        total_players = sum(len(t.players) for t in storage.teams.values())
-        confirmed_players = sum(
-            len([p for p in t.players if p.contact_confirmed]) 
-            for t in storage.teams.values()
+        # Обновляем сообщение в группе
+        await callback.message.edit_text(
+            f"❌ ЗАЯВКА ОТКЛОНЕНА #{app_id}\n\n"
+            f"👤 Игрок: {app[3]}\n"
+            f"🏷️ Команда: {app[1]}\n\n"
+            f"Статус: ❌ Отклонено"
         )
         
-        text = (
-            "📊 ПОДРОБНАЯ СТАТИСТИКА\n\n"
-            f"📈 Команды:\n"
-            f"• Всего: {len(storage.teams)}\n"
-            f"• Одобрено: {len(approved_teams)}\n"
-            f"• На рассмотрении: {len(pending_teams)}\n"
-            f"• Свободно мест: {storage.config['max_teams'] - len(approved_teams)}\n\n"
-            f"👥 Игроки:\n"
-            f"• Всего: {total_players}\n"
-            f"• Подтвердили: {confirmed_players}\n"
-            f"• Ждут подтверждения: {total_players - confirmed_players}\n\n"
-            f"📱 По устройствам (одобренные):\n"
-            f"• PC: {pc_count} команд\n"
-            f"• MOBILE: {mobile_count} команд\n"
-            f"• CC игроков: {sum(len([p for p in t.players if p.cc_ms == 'CC']) for t in approved_teams)}\n"
-            f"• MS игроков: {sum(len([p for p in t.players if p.cc_ms == 'MS']) for t in approved_teams)}"
-        )
-        
-        await query.edit_message_text(text)
+        await callback.answer("❌ Заявка отклонена!")
+
+# ========== ЗАПУСК БОТА ==========
+async def main():
+    """Главная функция запуска бота"""
+    print("=" * 50)
+    print("🤖 БОТ ДЛЯ РЕГИСТРАЦИИ НА ТУРНИР")
+    print("=" * 50)
     
-    async def admin_back(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Возврат в главное меню админа"""
-        query = update.callback_query
-        await query.answer()
-        
-        await self.admin_panel(Update(
-            update_id=update.update_id,
-            message=query.message
-        ), context)
+    # Проверка настроек
+    settings = get_settings()
     
-    async def list_teams(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Список всех команд"""
-        if not storage.teams:
-            await update.message.reply_text("📭 Нет зарегистрированных команд.")
-            return
-        
-        text = "🏆 СПИСОК КОМАНД\n\n"
-        
-        for team_name, team in storage.teams.items():
-            status_emoji = {
-                "pending": "⏳",
-                "approved": "✅",
-                "rejected": "❌"
-            }.get(team.status, "❓")
-            
-            confirmed_players = len([p for p in team.players if p.contact_confirmed])
-            
-            text += (
-                f"{status_emoji} {team_name}\n"
-                f"   📱 Устройство: {team.device_type}\n"
-                f"   👥 Игроков: {confirmed_players}/{len(team.players)}\n"
-                f"   👑 Капитан: {team.captain_username}\n"
-                f"   📅 Дата: {team.created_at.strftime('%d.%m.%Y %H:%M')}\n\n"
-            )
-        
-        await update.message.reply_text(text)
+    print(f"Токен: {'✅ Установлен' if BOT_TOKEN else '❌ НЕ УСТАНОВЛЕН'}")
+    print(f"Главный админ: {ADMIN_IDS[0]}")
+    print(f"Канал для подписки: {settings[2] or 'Не настроен'}")
+    print(f"Группа для модерации: {GROUP_ID}")
+    print(f"Лимит команд: {settings[0]}")
+    print(f"Размер команды: {settings[1]}")
+    print(f"Статус турнира: {'✅ Запущен' if settings[3] else '⏳ Регистрация'}")
+    print(f"Стадия турнира: {settings[4]}")
+    print("=" * 50)
+    print("Бот запущен...")
     
-    async def admin_approve_reject(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Одобрение/отклонение заявки админами"""
-        query = update.callback_query
-        await query.answer()
-        
-        parts = query.data.split("_", 1)
-        if len(parts) < 2:
-            return
-        
-        action, team_name = parts[0], parts[1]
-        
-        if team_name not in storage.teams:
-            await query.edit_message_text("❌ Команда не найдена!")
-            return
-        
-        team = storage.teams[team_name]
-        
-        if action == "approve":
-            team.status = "approved"
-            status_text = "✅ ОДОБРЕНО"
-            
-            # Уведомляем капитана
-            try:
-                await context.bot.send_message(
-                    chat_id=team.captain_id,
-                    text=f"🎉 Ваша команда '{team.name}' одобрена для участия в турнире!"
-                )
-                
-                # Уведомляем подтвержденных игроков
-                for player in team.players:
-                    if player.telegram_id and player.contact_confirmed and player.telegram_id != team.captain_id:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=player.telegram_id,
-                                text=f"🎉 Команда '{team.name}' одобрена для участия в турнире!"
-                            )
-                        except:
-                            pass
-                            
-            except Exception as e:
-                logger.error(f"Ошибка уведомления капитана: {e}")
-                
-        elif action == "reject":
-            team.status = "rejected"
-            status_text = "❌ ОТКЛОНЕНО"
-            
-            # Уведомляем капитана
-            try:
-                await context.bot.send_message(
-                    chat_id=team.captain_id,
-                    text=f"❌ Ваша команда '{team.name}' отклонена для участия в турнире."
-                )
-            except Exception as e:
-                logger.error(f"Ошибка уведомления капитана: {e}")
-        
-        # Обновляем сообщение в админской группе
-        original_text = query.message.caption
-        new_text = f"{original_text}\n\n{status_text}"
-        
-        await query.edit_message_caption(
-            caption=new_text,
-            reply_markup=None
-        )
-        
-        self.save_data()
-    
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отмена регистрации"""
-        user_id = update.effective_user.id
-        
-        if user_id in storage.registrations:
-            del storage.registrations[user_id]
-        
-        await update.message.reply_text(
-            "❌ Регистрация отменена.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ConversationHandler.END
-    
-    def setup_handlers(self, application):
-        """Настройка всех обработчиков"""
-        
-        # Основной ConversationHandler для регистрации
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('start', self.start)],
-            states={
-                States.DEVICE_TYPE.value: [
-                    CallbackQueryHandler(self.choose_device, pattern="^device_")
-                ],
-                States.TEAM_NAME.value: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_team_name)
-                ],
-                States.TEAM_PHOTO.value: [
-                    MessageHandler(filters.PHOTO, self.get_team_photo)
-                ],
-                States.PLAYERS.value: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_players_count)
-                ],
-                States.PLAYER_USERNAMES.value: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_player_usernames)
-                ],
-                States.CONFIRM_REGISTRATION.value: [
-                    CallbackQueryHandler(self.confirm_registration, pattern="^(confirm|edit|cancel)_registration")
-                ]
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)],
-        )
-        
-        # ConversationHandler для админских настроек
-        admin_conv_handler = ConversationHandler(
-            entry_points=[
-                CallbackQueryHandler(self.admin_add_admin, pattern="^admin_add$"),
-                CallbackQueryHandler(self.admin_change_setting, pattern="^setting_(max_teams|players_per_team)$")
-            ],
-            states={
-                States.ADMIN_ADD_ADMIN.value: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_add_admin)
-                ],
-                States.ADMIN_TEAM_LIMIT.value: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_team_limit)
-                ],
-                States.ADMIN_PLAYER_LIMIT.value: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_player_limit)
-                ]
-            },
-            fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
-        )
-        
-        # Основные команды
-        application.add_handler(CommandHandler('admin', self.admin_panel))
-        application.add_handler(CommandHandler('teams', self.list_teams))
-        application.add_handler(CommandHandler('generate', self.generate_brackets))
-        
-        # Обработчики колбэков
-        application.add_handler(CallbackQueryHandler(
-            self.admin_settings_menu, pattern="^admin_settings$"
-        ))
-        application.add_handler(CallbackQueryHandler(
-            self.admin_manage_admins, pattern="^admin_manage$"
-        ))
-        application.add_handler(CallbackQueryHandler(
-            self.admin_stats_detailed, pattern="^admin_stats$"
-        ))
-        application.add_handler(CallbackQueryHandler(
-            self.admin_change_setting, pattern="^setting_(open_reg|close_reg|generate_brackets|post_channel)$"
-        ))
-        application.add_handler(CallbackQueryHandler(
-            self.admin_back, pattern="^admin_back$"
-        ))
-        application.add_handler(CallbackQueryHandler(
-            self.player_confirmation, pattern="^player_(confirm|decline)_"
-        ))
-        
-        # Добавляем ConversationHandlers
-        application.add_handler(conv_handler)
-        application.add_handler(admin_conv_handler)
-        
-        # Обработчик одобрения/отклонения команд (для админской группы)
-        application.add_handler(CallbackQueryHandler(
-            self.admin_approve_reject, pattern="^(approve|reject)_"
-        ))
-        
-        # Обработчик информации о команде
-        application.add_handler(CallbackQueryHandler(
-            self.team_info, pattern="^info_"
-        ))
-    
-    async def team_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Информация о команде"""
-        query = update.callback_query
-        await query.answer()
-        
-        team_name = query.data.replace("info_", "")
-        
-        if team_name not in storage.teams:
-            await query.edit_message_text("❌ Команда не найдена!")
-            return
-        
-        team = storage.teams[team_name]
-        
-        players_info = ""
-        for i, player in enumerate(team.players, 1):
-            status = "✅ Подтвержден" if player.contact_confirmed else "⚠️ Ожидает"
-            device_info = f"{player.device_type}"
-            if player.device_type == "MOBILE" and player.cc_ms:
-                device_info = f"{player.device_type} ({player.cc_ms})"
-            
-            players_info += (
-                f"{i}. {player.username}\n"
-                f"   Устройство: {device_info}\n"
-                f"   Статус: {status}\n"
-                f"   ID: {player.telegram_id or 'Не привязан'}\n\n"
-            )
-        
-        info_text = (
-            f"📋 ИНФОРМАЦИЯ О КОМАНДЕ\n\n"
-            f"🏆 Название: {team.name}\n"
-            f"📱 Устройство: {team.device_type}\n"
-            f"👑 Капитан: {team.captain_username}\n"
-            f"📅 Дата регистрации: {team.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-            f"📊 Статус: {team.status}\n\n"
-            f"👥 Состав команды:\n{players_info}"
-        )
-        
-        await query.message.reply_text(info_text)
-    
-    def run(self):
-        """Запуск бота"""
-        application = Application.builder().token(self.token).build()
-        
-        self.setup_handlers(application)
-        
-        print(f"Бот запущен...")
-        print(f"Владелец: {OWNER_ID}")
-        print(f"Админ группа: {ADMIN_GROUP_ID}")
-        print(f"Канал: {NOTIFICATION_CHANNEL_ID}")
-        
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    bot = TournamentBot(TOKEN)
-    bot.run()
+    asyncio.run(main())
